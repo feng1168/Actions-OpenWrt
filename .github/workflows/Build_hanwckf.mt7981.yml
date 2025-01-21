@@ -112,7 +112,8 @@ jobs:
         echo -e "$(nproc) thread compile"
         make -j$(nproc) || make -j1 || make -j1 V=s
         cd bin/targets/*/*/
-        [ ! -f profiles.json ] && exit 1
+        ls
+        [ -f profiles.json ] || exit 1
 
     - name: Check space usage
       run: df -hT
