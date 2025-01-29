@@ -1,0 +1,160 @@
+name: Build lean x86
+
+on: 
+  schedule:
+    # 对应的是 UTC 时间，需要转换，0 代表北京时间8点
+    - cron: 20 1 22 * *
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: false
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede.git
+  REPO_BRANCH: master
+  CONFIG_FILE: lean.x86.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Show system
+      run: |
+        echo -e "Total CPU cores\t: $(nproc)"
+        cat /proc/cpuinfo | grep 'model name'
+        ulimit -a
+
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        swap-size-mb: 512
+        temp-reserve-mb: 1024
+        root-reserve-mb: 2048
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Init build dependencies
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo swapoff -a
+        docker rmi `docker images -q`
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /etc/mysql /etc/php
+        sudo -E apt-mark hold grub-efi-amd64-signed
+        sudo -E apt-get update
+        sudo -E apt -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* dotnet* snap*
+        sudo -E apt-get install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gettext gcc-multilib g++-multilib \
+          git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev \
+          libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libncurses-dev libpython3-dev libreadline-dev \
+          libssl-dev libtool llvm lrzsz genisoimage msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
+          python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo \
+          uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E systemctl daemon-reload
+        sudo -E apt-get autoremove --purge
+        sudo -E apt-get clean
+        sudo -E timedatectl set-timezone "Asia/Shanghai"
+
+    - name: Clone source code
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: chmod +x ./$DIY_P1_SH && cd openwrt && ../$DIY_P1_SH
+
+    - name: Update feeds
+      run:  |
+        cd openwrt && ./scripts/feeds update -a
+        if [[ $CONFIG_FILE == lean* ]]; then
+          rm -rf feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
+        fi
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x ./$DIY_P2_SH && cd openwrt && ../$DIY_P2_SH
+
+    - name: Start SSH via tmate
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      uses: P3TERX/ssh2actions@main
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}   
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j$(nproc)
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(($(nproc)+1)) thread compile"
+        make -j$(($(nproc)+1)) || make -j1 V=s
+        cd bin/targets/*/*/
+        echo ------------FileList------------
+        ls
+        [ -f profiles.json ] || exit 1
+
+    - name: Check space usage
+      run: df -hT
+
+    - name: Organize files
+      id: organize
+      run: |
+        cd openwrt/bin/targets/*/*/
+        rm -rf packages
+        rm -rf *.buildinfo
+        rm -rf sha256sums
+        rm -rf *.manifest
+        rm -rf *.itb
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "TAG_NAME=$(date +"%Y.%m.%d-${CONFIG_FILE%%.*}-$(echo $CONFIG_FILE | cut -d "." -f2)")" >> $GITHUB_ENV
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      with:
+        name: OpenWrt_firmware
+        path: ${{ env.FIRMWARE }}
+
+    - name: Upload firmware to release
+      id: create_release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ env.FIRMWARE }}/*
+        name: ${{ env.TAG_NAME }}
+        tag_name: ${{ env.TAG_NAME }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.3.3
+      with:
+        keep_latest: 66
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
